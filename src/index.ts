@@ -11,6 +11,7 @@ import express from 'express';
 import { getConfig } from './config.js';
 import { handleMessages, listModels, countTokens } from './handler.js';
 import { handleOpenAIChatCompletions, handleOpenAIResponses } from './openai-handler.js';
+import { serveLogViewer, apiGetLogs, apiGetRequests, apiGetStats, apiGetPayload, apiLogsStream } from './log-viewer.js';
 
 // 从 package.json 读取版本号，统一来源，避免多处硬编码
 const require = createRequire(import.meta.url);
@@ -34,6 +35,14 @@ app.use((_req, res, next) => {
     }
     next();
 });
+
+// ★ 日志查看器（在鉴权之前，始终可访问）
+app.get('/logs', serveLogViewer);
+app.get('/api/logs', apiGetLogs);
+app.get('/api/requests', apiGetRequests);
+app.get('/api/stats', apiGetStats);
+app.get('/api/payload/:requestId', apiGetPayload);
+app.get('/api/logs/stream', apiLogsStream);
 
 // ★ API 鉴权中间件：配置了 authTokens 则需要 Bearer token
 app.use((req, res, next) => {
@@ -97,6 +106,7 @@ app.get('/', (_req, res) => {
             openai_responses: 'POST /v1/responses',
             models: 'GET /v1/models',
             health: 'GET /health',
+            log_viewer: 'GET /logs',
         },
         usage: {
             claude_code: 'export ANTHROPIC_BASE_URL=http://localhost:' + config.port,
@@ -128,6 +138,9 @@ app.listen(config.port, () => {
     console.log('  ║  OpenAI / Cursor IDE:                 ║');
     console.log(`  ║  OPENAI_BASE_URL=                     ║`);
     console.log(`  ║    http://localhost:${config.port}/v1            ║`);
+    console.log('  ╠══════════════════════════════════════╣');
+    console.log('  ║  📊 Log Viewer:                       ║');
+    console.log(`  ║    http://localhost:${config.port}/logs           ║`);
     console.log('  ╚══════════════════════════════════════╝');
     console.log('');
 });

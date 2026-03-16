@@ -27,6 +27,7 @@ import type {
 import { convertToCursorRequest, parseToolCalls, hasToolCalls } from './converter.js';
 import { sendCursorRequest, sendCursorRequestFull } from './cursor-client.js';
 import { getConfig } from './config.js';
+import { createRequestLogger } from './logger.js';
 import {
     isRefusal,
     sanitizeResponse,
@@ -278,17 +279,37 @@ function extractOpenAIContent(msg: OpenAIMessage): string {
 export async function handleOpenAIChatCompletions(req: Request, res: Response): Promise<void> {
     const body = req.body as OpenAIChatRequest;
 
-    console.log(`[OpenAI] 收到请求: model=${body.model}, messages=${body.messages?.length}, stream=${body.stream}, tools=${body.tools?.length ?? 0}`);
+    const log = createRequestLogger({
+        method: req.method,
+        path: req.path,
+        model: body.model,
+        stream: !!body.stream,
+        hasTools: (body.tools?.length ?? 0) > 0,
+        toolCount: body.tools?.length ?? 0,
+        messageCount: body.messages?.length ?? 0,
+        apiFormat: 'openai',
+    });
+
+    log.startPhase('receive', '接收请求');
+    log.recordOriginalRequest(body);
+    log.info('OpenAI', 'receive', `收到 OpenAI Chat 请求`, {
+        model: body.model,
+        messageCount: body.messages?.length,
+        stream: body.stream,
+        toolCount: body.tools?.length ?? 0,
+    });
 
     try {
         // Step 1: OpenAI → Anthropic 格式
+        log.startPhase('convert', '格式转换 (OpenAI→Anthropic)');
         const anthropicReq = convertToAnthropicRequest(body);
+        log.endPhase();
 
         // 注意：图片预处理已移入 convertToCursorRequest → preprocessImages() 统一处理
 
         // Step 1.6: 身份探针拦截（复用 Anthropic handler 的逻辑）
         if (isIdentityProbe(anthropicReq)) {
-            console.log(`[OpenAI] 拦截到身份探针，返回模拟响应`);
+            log.intercepted('身份探针拦截 (OpenAI)');
             const mockText = "I am Claude, an advanced AI programming assistant created by Anthropic. I am ready to help you write code, debug, and answer your technical questions. Please let me know what we should work on!";
             if (body.stream) {
                 return handleOpenAIMockStream(res, body, mockText);
@@ -307,7 +328,7 @@ export async function handleOpenAIChatCompletions(req: Request, res: Response): 
         }
     } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
-        console.error(`[OpenAI] 请求处理失败:`, message);
+        log.fail(message);
         res.status(500).json({
             error: {
                 message,
@@ -403,7 +424,7 @@ async function handleOpenAIStream(
     try {
         await executeStream();
 
-        console.log(`[OpenAI] 原始响应 (${fullResponse.length} chars, tools=${hasTools}): ${fullResponse.substring(0, 200)}${fullResponse.length > 200 ? '...' : ''}`);
+        // 日志记录在详细日志中 (Web UI 可见)
 
         // ★ Thinking 提取（在拒绝检测之前）
         const thinkingEnabled = anthropicReq.thinking?.type === 'enabled';
@@ -415,7 +436,7 @@ async function handleOpenAIStream(
                     reasoningContent = thinkingMatch.map(m => m.replace(/<\/?thinking>/g, '').trim()).join('\n\n');
                 }
                 fullResponse = fullResponse.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '').trim();
-                console.log(`[OpenAI] 流式：剥离 thinking, 剩余 ${fullResponse.length} chars${thinkingEnabled ? ', 将发送 reasoning_content' : ''}`);
+                // thinking 剥离记录在详细日志中
             }
         }
 
@@ -428,7 +449,7 @@ async function handleOpenAIStream(
 
         while (shouldRetryRefusal() && retryCount < MAX_REFUSAL_RETRIES) {
             retryCount++;
-            console.log(`[OpenAI] 检测到拒绝（第${retryCount}次），自动重试...原始: ${fullResponse.substring(0, 100)}`);
+            // 重试记录在详细日志中
             const retryBody = buildRetryRequest(anthropicReq, retryCount - 1);
             activeCursorReq = await convertToCursorRequest(retryBody);
             await executeStream();
@@ -436,14 +457,14 @@ async function handleOpenAIStream(
         if (shouldRetryRefusal()) {
             if (!hasTools) {
                 if (isToolCapabilityQuestion(anthropicReq)) {
-                    console.log(`[OpenAI] 工具能力询问被拒绝，返回 Claude 能力描述`);
+                    // 记录在详细日志
                     fullResponse = CLAUDE_TOOLS_RESPONSE;
                 } else {
-                    console.log(`[OpenAI] 重试${MAX_REFUSAL_RETRIES}次后仍被拒绝，返回 Claude 身份回复`);
+                    // 记录在详细日志
                     fullResponse = CLAUDE_IDENTITY_RESPONSE;
                 }
             } else {
-                console.log(`[OpenAI] 工具模式下拒绝且无工具调用，引导模型输出`);
+                // 记录在详细日志
                 fullResponse = 'I understand the request. Let me analyze the information and proceed with the appropriate action.';
             }
         }
@@ -451,7 +472,7 @@ async function handleOpenAIStream(
         // 极短响应重试
         if (hasTools && fullResponse.trim().length < 10 && retryCount < MAX_REFUSAL_RETRIES) {
             retryCount++;
-            console.log(`[OpenAI] 响应过短 (${fullResponse.length} chars)，重试第${retryCount}次`);
+            // 记录在详细日志
             activeCursorReq = await convertToCursorRequest(anthropicReq);
             await executeStream();
         }
@@ -607,7 +628,7 @@ async function handleOpenAINonStream(
     let fullText = await sendCursorRequestFull(cursorReq);
     const hasTools = (body.tools?.length ?? 0) > 0;
 
-    console.log(`[OpenAI] 非流式原始响应 (${fullText.length} chars, tools=${hasTools}): ${fullText.substring(0, 300)}${fullText.length > 300 ? '...' : ''}`);
+    // 日志记录在详细日志中
 
     // ★ Thinking 提取必须在拒绝检测之前 — 否则 thinking 内容中的关键词会触发 isRefusal 误判
     const thinkingEnabled = anthropicReq.thinking?.type === 'enabled';
@@ -619,7 +640,7 @@ async function handleOpenAINonStream(
                 reasoningContent = thinkingMatch.map(m => m.replace(/<\/?thinking>/g, '').trim()).join('\n\n');
             }
             const stripped = fullText.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '').trim();
-            console.log(`[OpenAI] 剥离 thinking: ${fullText.length - stripped.length} chars, 剩余 ${stripped.length} chars${thinkingEnabled ? ', 将返回 reasoning_content' : ''}`);
+            // thinking 剥离记录
             fullText = stripped;
         }
     }
@@ -629,7 +650,7 @@ async function handleOpenAINonStream(
 
     if (shouldRetry()) {
         for (let attempt = 0; attempt < MAX_REFUSAL_RETRIES; attempt++) {
-            console.log(`[OpenAI] 非流式：检测到拒绝（第${attempt + 1}次重试）...原始: ${fullText.substring(0, 100)}`);
+            // 重试记录
             const retryBody = buildRetryRequest(anthropicReq, attempt);
             const retryCursorReq = await convertToCursorRequest(retryBody);
             fullText = await sendCursorRequestFull(retryCursorReq);
@@ -641,13 +662,13 @@ async function handleOpenAINonStream(
         }
         if (shouldRetry()) {
             if (hasTools) {
-                console.log(`[OpenAI] 非流式：工具模式下拒绝，引导模型输出`);
+                // 记录在详细日志
                 fullText = 'I understand the request. Let me analyze the information and proceed with the appropriate action.';
             } else if (isToolCapabilityQuestion(anthropicReq)) {
-                console.log(`[OpenAI] 非流式：工具能力询问被拒绝，返回 Claude 能力描述`);
+                // 记录在详细日志
                 fullText = CLAUDE_TOOLS_RESPONSE;
             } else {
-                console.log(`[OpenAI] 非流式：重试${MAX_REFUSAL_RETRIES}次后仍被拒绝，返回 Claude 身份回复`);
+                // 记录在详细日志
                 fullText = CLAUDE_IDENTITY_RESPONSE;
             }
         }
@@ -665,7 +686,7 @@ async function handleOpenAINonStream(
             // 清洗拒绝文本
             let cleanText = parsed.cleanText;
             if (isRefusal(cleanText)) {
-                console.log(`[OpenAI] 抑制工具模式下的拒绝文本: ${cleanText.substring(0, 100)}...`);
+                // 记录在详细日志
                 cleanText = '';
             }
             content = sanitizeResponse(cleanText) || null;
